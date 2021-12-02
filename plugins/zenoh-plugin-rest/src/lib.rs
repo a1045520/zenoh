@@ -26,6 +26,16 @@ use zenoh::net::*;
 use zenoh::{Change, Selector, Value};
 use zenoh_plugin_trait::prelude::*;
 
+use opentelemetry_tide::{MetricsConfig, TideExt};
+use opentelemetry_semantic_conventions::resource;
+use opentelemetry::sdk::{
+    propagation::TraceContextPropagator,
+    trace::Tracer,
+};
+use opentelemetry::{global, trace::TraceError};
+
+const SVC_NAME: &str = env!("CARGO_CRATE_NAME");
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 const PORT_SEPARATOR: char = ':';
 const DEFAULT_HTTP_HOST: &str = "0.0.0.0";
 const DEFAULT_HTTP_PORT: &str = "8000";
@@ -364,6 +374,26 @@ async fn write(mut req: Request<(Arc<Session>, String)>) -> tide::Result<Respons
     }
 }
 
+#[inline]
+fn init_tracer(svc_name: &str, version: &str, instance_id: &str) -> Result<Tracer, TraceError> {
+    // W3C spec: https://www.w3.org/TR/trace-context/ - only for trace context info
+    global::set_text_map_propagator(TraceContextPropagator::new());
+
+    // (option) A set of standardized attributes, ref: https://github.com/open-telemetry/opentelemetry-specification/tree/main/specification/resource/semantic_conventions
+    let tags = [
+        resource::SERVICE_VERSION.string(version.to_owned()),
+        resource::SERVICE_INSTANCE_ID.string(instance_id.to_owned()),
+        resource::PROCESS_EXECUTABLE_PATH.string(std::env::current_exe().unwrap().display().to_string()),
+        resource::PROCESS_PID.string(std::process::id().to_string()),
+    ];
+
+    // Initialize the tracker with jaeger as backend
+    opentelemetry_jaeger::new_pipeline()
+        .with_service_name(svc_name)
+        .with_tags(tags.iter().map(ToOwned::to_owned))
+        .install_batch(opentelemetry::runtime::AsyncStd)
+}
+
 pub async fn run(runtime: Runtime, port: String) {
     // Try to initiate login.
     // Required in case of dynamic lib, otherwise no logs.
@@ -371,6 +401,8 @@ pub async fn run(runtime: Runtime, port: String) {
     let _ = env_logger::try_init();
 
     let http_port = parse_http_port(&port);
+
+    let tracer = init_tracer(SVC_NAME, VERSION, "Zenoh REST library").unwrap();
 
     let pid = runtime.get_pid_str();
     let session = Session::init(runtime, true, vec![], vec![]).await;
@@ -387,6 +419,8 @@ pub async fn run(runtime: Runtime, port: String) {
             .allow_credentials(false),
     );
 
+    app.with_middlewares(tracer, MetricsConfig::default());
+    
     app.at("/").get(query);
     app.at("*").get(query);
 
@@ -402,6 +436,8 @@ pub async fn run(runtime: Runtime, port: String) {
     if let Err(e) = app.listen(http_port).await {
         log::error!("Unable to start http server for REST : {:?}", e);
     }
+    opentelemetry::global::force_flush_tracer_provider();
+    opentelemetry::global::shutdown_tracer_provider();
 }
 
 fn path_to_resource(path: &str, pid: &str) -> ResKey {
