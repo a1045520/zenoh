@@ -3015,6 +3015,7 @@ dependencies = [
  "nix",
  "opentelemetry",
  "opentelemetry-jaeger",
+ "opentelemetry-semantic-conventions",
  "petgraph",
  "quinn",
  "rand 0.8.4",

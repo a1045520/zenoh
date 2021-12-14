@@ -1,0 +1,1226 @@
+From 48e92dffc41d7acf40374b532678de21604f2e36 Mon Sep 17 00:00:00 2001
+From: a1045520 <a1045520@gmail.com>
+Date: Thu, 2 Dec 2021 08:06:23 +0800
+Subject: [PATCH 2/2] Temp commit
+
+---
+ zenoh/Cargo.toml                  |  18 +++
+ zenoh/examples/zenoh/computing.rs | 152 +++++++++++++++++++++++
+ zenoh/examples/zenoh/motion.rs    | 145 ++++++++++++++++++++++
+ zenoh/examples/zenoh/sensor.rs    | 156 ++++++++++++++++++++++++
+ zenoh/examples/zenoh/t_eval.rs    | 195 ++++++++++++++++++++++++++++++
+ zenoh/examples/zenoh/t_get.rs     | 132 ++++++++++++++++++++
+ zenoh/examples/zenoh/t_put.rs     | 156 ++++++++++++++++++++++++
+ zenoh/examples/zenoh/t_sub.rs     | 145 ++++++++++++++++++++++
+ zenoh/src/net/session.rs          |  21 +++-
+ 9 files changed, 1119 insertions(+), 1 deletion(-)
+ create mode 100644 zenoh/examples/zenoh/computing.rs
+ create mode 100644 zenoh/examples/zenoh/motion.rs
+ create mode 100644 zenoh/examples/zenoh/sensor.rs
+ create mode 100644 zenoh/examples/zenoh/t_eval.rs
+ create mode 100644 zenoh/examples/zenoh/t_get.rs
+ create mode 100644 zenoh/examples/zenoh/t_put.rs
+ create mode 100644 zenoh/examples/zenoh/t_sub.rs
+
+diff --git a/zenoh/Cargo.toml b/zenoh/Cargo.toml
+index efa862f..4f7f92b 100644
+--- a/zenoh/Cargo.toml
++++ b/zenoh/Cargo.toml
+@@ -89,6 +89,8 @@ uhlc = "0.3.1"
+ uuid = { version = "0.8.2", features = ["v4"] }
+ vec_map = "0.8.2"
+ webpki = { version = "0.22.0", features = ["std"], optional = true }
++opentelemetry = { version = "0.16.0", features = ["rt-async-std"] }
++opentelemetry-jaeger = { version = "0.15.0", features = ["rt-async-std"] }
+ 
+ [dev-dependencies]
+ clap = "2.33.3"
+@@ -218,6 +220,22 @@ path = "examples/zenoh-net/zn_ping.rs"
+ name = "zn_pong"
+ path = "examples/zenoh-net/zn_pong.rs"
+ 
++[[example]]
++name = "t_eval"
++path = "examples/zenoh/t_eval.rs"
++
++[[example]]
++name = "t_get"
++path = "examples/zenoh/t_get.rs"
++
++[[example]]
++name = "t_put"
++path = "examples/zenoh/t_put.rs"
++
++[[example]]
++name = "t_sub"
++path = "examples/zenoh/t_sub.rs"
++
+ [[bench]]
+ name = "codec_bench"
+ harness = false
+diff --git a/zenoh/examples/zenoh/computing.rs b/zenoh/examples/zenoh/computing.rs
+new file mode 100644
+index 0000000..81fde84
+--- /dev/null
++++ b/zenoh/examples/zenoh/computing.rs
+@@ -0,0 +1,152 @@
++//
++// Copyright (c) 2017, 2020 ADLINK Technology Inc.
++//
++// This program and the accompanying materials are made available under the
++// terms of the Eclipse Public License 2.0 which is available at
++// http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
++// which is available at https://www.apache.org/licenses/LICENSE-2.0.
++//
++// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
++//
++// Contributors:
++//   ADLINK zenoh team, <zenoh@adlink-labs.tech>
++//
++use clap::{App, Arg};
++use futures::prelude::*;
++use futures::select;
++use std::convert::{TryFrom, TryInto};
++use zenoh::*;
++use opentelemetry::trace::TraceError;
++use opentelemetry::{
++    global,
++    sdk::{trace as sdktrace, propagation::TraceContextPropagator},
++    trace::{FutureExt, TraceContextExt, Tracer},
++    Context,
++};
++use opentelemetry_jaeger;
++use std::collections::HashMap;
++use std::{thread, time};
++
++#[async_std::main]
++async fn main() {
++    // initiate logging
++    env_logger::init();
++    // initate tracer
++    let _ = init_global_tracer().unwrap();
++
++    let (config, selector) = parse_args();
++
++    println!("New zenoh...");
++    let zenoh = Zenoh::new(config.into()).await.unwrap();
++
++    println!("New workspace...");
++    let workspace = zenoh.workspace(None).await.unwrap();
++
++    println!("Subscribe to {}'...\n", selector);
++    let mut change_stream = workspace
++        .subscribe(&selector.try_into().unwrap())
++        .await
++        .unwrap();
++
++    let mut stdin = async_std::io::stdin();
++    let mut input = [0u8];
++    loop {
++        select!(
++            change = change_stream.next().fuse() => {
++                let change = change.unwrap();
++                // read the trace format
++                let mut req_header = HashMap::new();
++                if let Value::StringUtf8(value) = change.value.unwrap(){
++                    req_header.insert("traceparent".to_string(), value.clone());
++
++                    println!(
++                        ">> [Subscription listener] received {:?} for {} : {:?} with timestamp {}",
++                        change.kind,
++                        change.path,
++                        value,
++                        change.timestamp
++                    )
++                };
++        
++                let parent_cx = global::get_text_map_propagator(|propagator| propagator.extract(&req_header));
++                println!("{:?}", parent_cx);
++
++                let span = global::tracer("computing.rs").start_with_context("Get sensor data and start computing", parent_cx);
++                let cx = Context::current_with_span(span);
++                // Computing
++                thread::sleep(time::Duration::from_millis(300));
++                workspace
++                .put(&"/motion".try_into().unwrap(), req_header["traceparent"].clone().into())
++                .with_context(cx.clone())
++                .await
++                .unwrap();
++            }
++
++            _ = stdin.read_exact(&mut input).fuse() => {
++                if input[0] == b'q' {break}
++            }
++        );
++    }
++
++    change_stream.close().await.unwrap();
++    zenoh.close().await.unwrap();
++}
++
++fn init_global_tracer() -> Result<sdktrace::Tracer, TraceError>{
++    global::set_text_map_propagator(TraceContextPropagator::new());
++    // let tags = [
++    //     resource::SERVICE_VERSION.string(version.to_owned()),
++    //     resource::SERVICE_INSTANCE_ID.string(instance_id.to_owned()),
++    //     resource::PROCESS_EXECUTABLE_PATH.string(std::env::current_exe().unwrap().display().to_string()),
++    //     resource::PROCESS_PID.string(std::process::id().to_string()),
++    //     KeyValue::new("process.executable.profile", PROFILE),
++    // ];
++
++    opentelemetry_jaeger::new_pipeline()
++        .with_service_name("computing")
++        //.with_tags(tags.iter().map(ToOwned::to_owned))
++        .install_batch(opentelemetry::runtime::AsyncStd)
++}
++
++fn parse_args() -> (Properties, String) {
++    let args = App::new("zenoh subscriber example")
++        .arg(
++            Arg::from_usage("-m, --mode=[MODE] 'The zenoh session mode (peer by default).")
++                .possible_values(&["peer", "client"]),
++        )
++        .arg(Arg::from_usage(
++            "-e, --peer=[LOCATOR]...  'Peer locators used to initiate the zenoh session.'",
++        ))
++        .arg(Arg::from_usage(
++            "-l, --listener=[LOCATOR]...   'Locators to listen on.'",
++        ))
++        .arg(Arg::from_usage(
++            "-c, --config=[FILE]      'A configuration file.'",
++        ))
++        .arg(
++            Arg::from_usage("-s, --selector=[selector] 'The selection of resources to subscribe'")
++                .default_value("/demo/example/**"),
++        )
++        .arg(Arg::from_usage(
++            "--no-multicast-scouting 'Disable the multicast-based scouting mechanism.'",
++        ))
++        .get_matches();
++
++    let mut config = if let Some(conf_file) = args.value_of("config") {
++        Properties::try_from(std::path::Path::new(conf_file)).unwrap()
++    } else {
++        Properties::default()
++    };
++    for key in ["mode", "peer", "listener"].iter() {
++        if let Some(value) = args.values_of(key) {
++            config.insert(key.to_string(), value.collect::<Vec<&str>>().join(","));
++        }
++    }
++    if args.is_present("no-multicast-scouting") {
++        config.insert("multicast_scouting".to_string(), "false".to_string());
++    }
++
++    let selector = args.value_of("selector").unwrap().to_string();
++
++    (config, selector)
++}
+diff --git a/zenoh/examples/zenoh/motion.rs b/zenoh/examples/zenoh/motion.rs
+new file mode 100644
+index 0000000..0ec08a8
+--- /dev/null
++++ b/zenoh/examples/zenoh/motion.rs
+@@ -0,0 +1,145 @@
++//
++// Copyright (c) 2017, 2020 ADLINK Technology Inc.
++//
++// This program and the accompanying materials are made available under the
++// terms of the Eclipse Public License 2.0 which is available at
++// http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
++// which is available at https://www.apache.org/licenses/LICENSE-2.0.
++//
++// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
++//
++// Contributors:
++//   ADLINK zenoh team, <zenoh@adlink-labs.tech>
++//
++use clap::{App, Arg};
++use futures::prelude::*;
++use futures::select;
++use std::convert::{TryFrom, TryInto};
++use zenoh::*;
++use opentelemetry::trace::TraceError;
++use opentelemetry::{
++    global,
++    sdk::{trace as sdktrace, propagation::TraceContextPropagator},
++    trace::{FutureExt, TraceContextExt, Tracer},
++    Context,
++};
++use opentelemetry_jaeger;
++use std::collections::HashMap;
++use std::{thread, time};
++
++#[async_std::main]
++async fn main() {
++    // initiate logging
++    env_logger::init();
++    // initate tracer
++    let _ = init_global_tracer().unwrap();
++
++    let (config, selector) = parse_args();
++
++    println!("New zenoh...");
++    let zenoh = Zenoh::new(config.into()).await.unwrap();
++
++    println!("New workspace...");
++    let workspace = zenoh.workspace(None).await.unwrap();
++
++    println!("Subscribe to {}'...\n", selector);
++    let mut change_stream = workspace
++        .subscribe(&selector.try_into().unwrap())
++        .await
++        .unwrap();
++
++    let mut stdin = async_std::io::stdin();
++    let mut input = [0u8];
++    loop {
++        select!(
++            change = change_stream.next().fuse() => {
++                let change = change.unwrap();
++                // read the trace format
++                let mut req_header = HashMap::new();
++                if let Value::StringUtf8(value) = change.value.unwrap(){
++                    req_header.insert("traceparent".to_string(), value.clone());
++
++                    println!(
++                        ">> [Subscription listener] received {:?} for {} : {:?} with timestamp {}",
++                        change.kind,
++                        change.path,
++                        value,
++                        change.timestamp
++                    )
++                };
++        
++                let parent_cx = global::get_text_map_propagator(|propagator| propagator.extract(&req_header));
++                println!("{:?}", parent_cx);
++
++                let span = global::tracer("motion.rs").start_with_context("Get computing output and start motion", parent_cx);
++                thread::sleep(time::Duration::from_millis(100));
++            }
++
++            _ = stdin.read_exact(&mut input).fuse() => {
++                if input[0] == b'q' {break}
++            }
++        );
++    }
++
++    change_stream.close().await.unwrap();
++    zenoh.close().await.unwrap();
++}
++
++fn init_global_tracer() -> Result<sdktrace::Tracer, TraceError>{
++    global::set_text_map_propagator(TraceContextPropagator::new());
++    // let tags = [
++    //     resource::SERVICE_VERSION.string(version.to_owned()),
++    //     resource::SERVICE_INSTANCE_ID.string(instance_id.to_owned()),
++    //     resource::PROCESS_EXECUTABLE_PATH.string(std::env::current_exe().unwrap().display().to_string()),
++    //     resource::PROCESS_PID.string(std::process::id().to_string()),
++    //     KeyValue::new("process.executable.profile", PROFILE),
++    // ];
++
++    opentelemetry_jaeger::new_pipeline()
++        .with_service_name("motion")
++        //.with_tags(tags.iter().map(ToOwned::to_owned))
++        .install_batch(opentelemetry::runtime::AsyncStd)
++}
++
++fn parse_args() -> (Properties, String) {
++    let args = App::new("zenoh subscriber example")
++        .arg(
++            Arg::from_usage("-m, --mode=[MODE] 'The zenoh session mode (peer by default).")
++                .possible_values(&["peer", "client"]),
++        )
++        .arg(Arg::from_usage(
++            "-e, --peer=[LOCATOR]...  'Peer locators used to initiate the zenoh session.'",
++        ))
++        .arg(Arg::from_usage(
++            "-l, --listener=[LOCATOR]...   'Locators to listen on.'",
++        ))
++        .arg(Arg::from_usage(
++            "-c, --config=[FILE]      'A configuration file.'",
++        ))
++        .arg(
++            Arg::from_usage("-s, --selector=[selector] 'The selection of resources to subscribe'")
++                .default_value("/demo/example/**"),
++        )
++        .arg(Arg::from_usage(
++            "--no-multicast-scouting 'Disable the multicast-based scouting mechanism.'",
++        ))
++        .get_matches();
++
++    let mut config = if let Some(conf_file) = args.value_of("config") {
++        Properties::try_from(std::path::Path::new(conf_file)).unwrap()
++    } else {
++        Properties::default()
++    };
++    for key in ["mode", "peer", "listener"].iter() {
++        if let Some(value) = args.values_of(key) {
++            config.insert(key.to_string(), value.collect::<Vec<&str>>().join(","));
++        }
++    }
++    if args.is_present("no-multicast-scouting") {
++        config.insert("multicast_scouting".to_string(), "false".to_string());
++    }
++
++    let selector = args.value_of("selector").unwrap().to_string();
++
++    (config, selector)
++}
+diff --git a/zenoh/examples/zenoh/sensor.rs b/zenoh/examples/zenoh/sensor.rs
+new file mode 100644
+index 0000000..703bd41
+--- /dev/null
++++ b/zenoh/examples/zenoh/sensor.rs
+@@ -0,0 +1,156 @@
++//
++// Copyright (c) 2017, 2020 ADLINK Technology Inc.
++//
++// This program and the accompanying materials are made available under the
++// terms of the Eclipse Public License 2.0 which is available at
++// http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
++// which is available at https://www.apache.org/licenses/LICENSE-2.0.
++//
++// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
++//
++// Contributors:
++//   ADLINK zenoh team, <zenoh@adlink-labs.tech>
++//
++use clap::{App, Arg};
++use std::convert::{TryFrom, TryInto};
++use zenoh::*;
++use opentelemetry::trace::TraceError;
++use opentelemetry::{
++    global,
++    sdk::{trace as sdktrace, propagation::TraceContextPropagator},
++    trace::{FutureExt, TraceContextExt, Tracer},
++    Context,
++};
++use opentelemetry_jaeger;
++use std::collections::HashMap;
++
++#[async_std::main]
++async fn main() {
++    // initiate logging
++    env_logger::init();
++    // initate tracer
++    let _ = init_global_tracer().unwrap();
++    let span = global::tracer("sensor.rs").start("Put data");
++    let cx = Context::current_with_span(span);
++    let mut injector = HashMap::new();
++    global::get_text_map_propagator(|propagator| propagator.inject_context(&cx, &mut injector));
++
++    let (config, path, _value) = parse_args();
++
++    println!("New zenoh...");
++    let zenoh = Zenoh::new(config.into()).with_context(cx.clone()).await.unwrap();
++
++    println!("New workspace...");
++    let workspace = zenoh.workspace(None).with_context(cx.clone()).await.unwrap();
++
++    println!("Put Data ('{}': '{}')...\n", path, injector["traceparent"]);
++    workspace
++        .put(&path.try_into().unwrap(), injector["traceparent"].clone().into())
++        .with_context(cx.clone())
++        .await
++        .unwrap();
++
++    // --- Examples of put with other types:
++
++    // - Integer
++    // workspace.put(&"/demo/example/Integer".try_into().unwrap(), 3.into())
++    //     .await.unwrap();
++
++    // - Float
++    // workspace.put(&"/demo/example/Float".try_into().unwrap(), 3.14.into())
++    //     .await.unwrap();
++
++    // - Properties (as a Dictionary with str only)
++    // workspace.put(
++    //         &"/demo/example/Properties".try_into().unwrap(),
++    //         Properties::from("p1=v1;p2=v2").into()
++    //     ).await.unwrap();
++
++    // - Json (str format)
++    // workspace.put(
++    //         &"/demo/example/Json".try_into().unwrap(),
++    //         Value::Json(r#"{"kind"="memory"}"#.to_string()),
++    //     ).await.unwrap();
++
++    // - Raw ('application/octet-stream' encoding by default)
++    // workspace.put(
++    //         &"/demo/example/Raw".try_into().unwrap(),
++    //         vec![0x48u8, 0x69, 0x33].into(),
++    //     ).await.unwrap();
++
++    // - Custom
++    // workspace.put(
++    //         &"/demo/example/Custom".try_into().unwrap(),
++    //         Value::Custom {
++    //             encoding_descr: "my_encoding".to_string(),
++    //             data: vec![0x48u8, 0x69, 0x33].into(),
++    //     }).await.unwrap();
++
++    zenoh.close().with_context(cx).await.unwrap();
++    opentelemetry::global::force_flush_tracer_provider();
++    opentelemetry::global::shutdown_tracer_provider();
++}
++
++fn init_global_tracer() -> Result<sdktrace::Tracer, TraceError>{
++    global::set_text_map_propagator(TraceContextPropagator::new());
++    // let tags = [
++    //     resource::SERVICE_VERSION.string(version.to_owned()),
++    //     resource::SERVICE_INSTANCE_ID.string(instance_id.to_owned()),
++    //     resource::PROCESS_EXECUTABLE_PATH.string(std::env::current_exe().unwrap().display().to_string()),
++    //     resource::PROCESS_PID.string(std::process::id().to_string()),
++    //     KeyValue::new("process.executable.profile", PROFILE),
++    // ];
++
++    opentelemetry_jaeger::new_pipeline()
++        .with_service_name("sensor")
++        //.with_tags(tags.iter().map(ToOwned::to_owned))
++        .install_batch(opentelemetry::runtime::AsyncStd)
++}
++
++fn parse_args() -> (Properties, String, String) {
++    let args = App::new("zenoh put example")
++        .arg(
++            Arg::from_usage("-m, --mode=[MODE] 'The zenoh session mode (peer by default).")
++                .possible_values(&["peer", "client"]),
++        )
++        .arg(Arg::from_usage(
++            "-e, --peer=[LOCATOR]...  'Peer locators used to initiate the zenoh session.'",
++        ))
++        .arg(Arg::from_usage(
++            "-l, --listener=[LOCATOR]...   'Locators to listen on.'",
++        ))
++        .arg(Arg::from_usage(
++            "-c, --config=[FILE]      'A configuration file.'",
++        ))
++        .arg(
++            Arg::from_usage("-p, --path=[PATH]        'The name of the resource to put.'")
++                .default_value("/demo/example/zenoh-rs-put"),
++        )
++        .arg(
++            Arg::from_usage("-v, --value=[VALUE]      'The value of the resource to put.'")
++                .default_value("Put from Rust!"),
++        )
++        .arg(Arg::from_usage(
++            "--no-multicast-scouting 'Disable the multicast-based scouting mechanism.'",
++        ))
++        .get_matches();
++
++    let mut config = if let Some(conf_file) = args.value_of("config") {
++        Properties::try_from(std::path::Path::new(conf_file)).unwrap()
++    } else {
++        Properties::default()
++    };
++    for key in ["mode", "peer", "listener"].iter() {
++        if let Some(value) = args.values_of(key) {
++            config.insert(key.to_string(), value.collect::<Vec<&str>>().join(","));
++        }
++    }
++    if args.is_present("no-multicast-scouting") {
++        config.insert("multicast_scouting".to_string(), "false".to_string());
++    }
++
++    let path = args.value_of("path").unwrap().to_string();
++    let value = args.value_of("value").unwrap().to_string();
++
++    (config, path, value)
++}
+diff --git a/zenoh/examples/zenoh/t_eval.rs b/zenoh/examples/zenoh/t_eval.rs
+new file mode 100644
+index 0000000..198bb70
+--- /dev/null
++++ b/zenoh/examples/zenoh/t_eval.rs
+@@ -0,0 +1,195 @@
++//
++// Copyright (c) 2017, 2020 ADLINK Technology Inc.
++//
++// This program and the accompanying materials are made available under the
++// terms of the Eclipse Public License 2.0 which is available at
++// http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
++// which is available at https://www.apache.org/licenses/LICENSE-2.0.
++//
++// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
++//
++// Contributors:
++//   ADLINK zenoh team, <zenoh@adlink-labs.tech>
++//
++use clap::{App, Arg};
++use futures::prelude::*;
++use std::convert::TryFrom;
++use zenoh::*;
++use opentelemetry::{
++    global,
++    sdk::{trace as sdktrace, propagation::TraceContextPropagator},
++    trace::{FutureExt, TraceContextExt, Tracer},
++    Context,
++};
++// use opentelemetry_semantic_conventions::{resource, trace};
++use opentelemetry::trace::TraceError;
++use opentelemetry_jaeger;
++use std::collections::HashMap;
++
++#[async_std::main]
++async fn main() {
++    // initiate logging
++    env_logger::init();
++    // initiate tracer
++    let _ = init_global_tracer().unwrap();
++
++    let (config, path) = parse_args();
++
++    // NOTE: in this example we choosed to register the eval for a single Path,
++    // and to send replies with this same Path.
++    // But we could also register an eval for a PathExpr. In this case,
++    // the eval implementation should choose the Path(s) for reply(ies) that
++    // are coherent with the Selector received in GetRequest.
++    let path = &Path::try_from(path).unwrap();
++
++    println!("New zenoh...");
++    let zenoh = Zenoh::new(config.into()).await.unwrap();
++
++    println!("New workspace...");
++    let workspace = zenoh.workspace(None).await.unwrap();
++
++    let mut get_stream = workspace.register_eval(&path.into()).await.unwrap();
++
++    println!("Subscribe to {}'...\n", path);
++    let mut change_stream = workspace
++    .subscribe(&path.into())
++    .await
++    .unwrap();
++
++    let change = change_stream.next().await.unwrap();
++    println!(
++        ">> [Subscription listener] received {:?} for {} : {:?} with timestamp {}",
++        change.kind,
++        change.path,
++        change.value,
++        change.timestamp
++    );
++    // read the trace format
++    let mut req_header = HashMap::new();
++    if let Value::StringUtf8(value) =  change.value.unwrap(){
++        req_header.insert("traceparent".to_string(), value);
++    };
++
++
++    let parent_cx = global::get_text_map_propagator(|propagator| propagator.extract(&req_header));
++    drop(req_header);
++
++    println!("Register eval for {}'...\n", path);
++    
++    let get_request = get_stream.next().await.unwrap();
++
++    // Add attributes if needed
++    // let mut span_builder = global::tracer("z_eval")
++    //     .span_builder("z_eval")
++    //     .with_kind(SpanKind::Server);
++    let span = global::tracer("z_eval.rs").start_with_context("Request time", parent_cx);
++    let cx = Context::current_with_span(span);
++
++    println!(
++        ">> [Eval listener] received get with selector: {}",
++        get_request.selector
++    );
++
++    // The returned Value is a StringValue with a 'name' part which is set in 3 possible ways,
++    // depending the properties specified in the selector. For example, with the
++    // following selectors:
++    // - "/zenoh/example/eval" : no properties are set, a default value is used for the name
++    // - "/zenoh/example/eval?(name=Bob)" : "Bob" is used for the name
++    // - "/zenoh/example/eval?(name=/zenoh/example/name)" : the Eval function does a GET
++    //      on "/zenoh/example/name" an uses the 1st result for the name
++    let mut name = get_request
++        .selector
++        .properties
++        .get("name")
++        .cloned()
++        .unwrap_or_else(|| "Rust!".to_string());
++    if name.starts_with('/') {
++        println!("   >> Get name to use from path: {}", name);
++        if let Ok(selector) = Selector::try_from(name.as_str()) {
++            match workspace.get(&selector).await.unwrap().next().with_context(cx.clone()).await {
++                Some(Data {
++                    path: _,
++                    value: Value::StringUtf8(s),
++                    timestamp: _,
++                }) => name = s,
++                Some(_) => println!("Failed to get name from '{}' : not a UTF-8 String", name),
++                None => println!("Failed to get name from '{}' : not found", name),
++            }
++        } else {
++            println!(
++                "Failed to get value from '{}' : this is not a valid Selector",
++                name
++            );
++        }
++    }
++    let s = format!("Eval from {}", name);
++    println!(r#"   >> Returning string: "{}""#, s);
++    get_request.reply_async(path.clone(), s.into()).with_context(cx.clone()).await;
++    
++    
++    change_stream.close().with_context(cx.clone()).await.unwrap();
++    get_stream.close().with_context(cx.clone()).await.unwrap();
++    zenoh.close().with_context(cx).await.unwrap();
++
++    opentelemetry::global::force_flush_tracer_provider();
++    opentelemetry::global::shutdown_tracer_provider();
++}
++
++fn init_global_tracer() -> Result<sdktrace::Tracer, TraceError>{
++    global::set_text_map_propagator(TraceContextPropagator::new());
++    // let tags = [
++    //     resource::SERVICE_VERSION.string(version.to_owned()),
++    //     resource::SERVICE_INSTANCE_ID.string(instance_id.to_owned()),
++    //     resource::PROCESS_EXECUTABLE_PATH.string(std::env::current_exe().unwrap().display().to_string()),
++    //     resource::PROCESS_PID.string(std::process::id().to_string()),
++    //     KeyValue::new("process.executable.profile", PROFILE),
++    // ];
++
++    opentelemetry_jaeger::new_pipeline()
++        .with_service_name("z_eval")
++        //.with_tags(tags.iter().map(ToOwned::to_owned))
++        .install_batch(opentelemetry::runtime::AsyncStd)
++}
++
++fn parse_args() -> (Properties, String) {
++    let args = App::new("zenoh eval example")
++        .arg(
++            Arg::from_usage("-m, --mode=[MODE] 'The zenoh session mode (peer by default).")
++                .possible_values(&["peer", "client"]),
++        )
++        .arg(Arg::from_usage(
++            "-e, --peer=[LOCATOR]...  'Peer locators used to initiate the zenoh session.'",
++        ))
++        .arg(Arg::from_usage(
++            "-l, --listener=[LOCATOR]...   'Locators to listen on.'",
++        ))
++        .arg(Arg::from_usage(
++            "-c, --config=[FILE]      'A configuration file.'",
++        ))
++        .arg(
++            Arg::from_usage("-p, --path=[PATH] 'The path the eval will respond for'")
++                .default_value("/demo/example/eval"),
++        )
++        .arg(Arg::from_usage(
++            "--no-multicast-scouting 'Disable the multicast-based scouting mechanism.'",
++        ))
++        .get_matches();
++
++    let mut config = if let Some(conf_file) = args.value_of("config") {
++        Properties::try_from(std::path::Path::new(conf_file)).unwrap()
++    } else {
++        Properties::default()
++    };
++    for key in ["mode", "peer", "listener"].iter() {
++        if let Some(value) = args.values_of(key) {
++            config.insert(key.to_string(), value.collect::<Vec<&str>>().join(","));
++        }
++    }
++    if args.is_present("no-multicast-scouting") {
++        config.insert("multicast_scouting".to_string(), "false".to_string());
++    }
++
++    let path = args.value_of("path").unwrap().to_string();
++
++    (config, path)
++}
+diff --git a/zenoh/examples/zenoh/t_get.rs b/zenoh/examples/zenoh/t_get.rs
+new file mode 100644
+index 0000000..d53d943
+--- /dev/null
++++ b/zenoh/examples/zenoh/t_get.rs
+@@ -0,0 +1,132 @@
++//
++// Copyright (c) 2017, 2020 ADLINK Technology Inc.
++//
++// This program and the accompanying materials are made available under the
++// terms of the Eclipse Public License 2.0 which is available at
++// http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
++// which is available at https://www.apache.org/licenses/LICENSE-2.0.
++//
++// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
++//
++// Contributors:
++//   ADLINK zenoh team, <zenoh@adlink-labs.tech>
++//
++use clap::{App, Arg};
++use futures::prelude::*;
++use std::convert::{TryFrom, TryInto};
++use zenoh::*;
++use opentelemetry::trace::TraceError;
++use opentelemetry::{
++    global,
++    sdk::{trace as sdktrace, propagation::TraceContextPropagator},
++    trace::{FutureExt, TraceContextExt, Tracer},
++    Context,
++};
++use opentelemetry_jaeger;
++use std::collections::HashMap;
++
++#[async_std::main]
++async fn main() {
++    // initiate logging
++    env_logger::init();
++    // initiate tracer
++    let _ = init_global_tracer().unwrap();
++    let span = global::tracer("z_get.rs").start("Root");
++    let cx = Context::current_with_span(span);
++    let mut injector = HashMap::new();
++    global::get_text_map_propagator(|propagator| propagator.inject_context(&cx, &mut injector));
++
++    // for (k, v) in &injector{
++    //     println!("key is {}, value is {}", k, v);
++    // }
++    let (config, selector) = parse_args();
++
++    println!("New zenoh...");
++    let zenoh = Zenoh::new(config.into()).with_context(cx.clone()).await.unwrap();
++
++    println!("New workspace...");
++    let workspace = zenoh.workspace(None).with_context(cx.clone()).await.unwrap();
++    // use if let && currently sent traceparent only.
++    if injector.contains_key("traceparent") {
++        println!("Put Span Data ('{}')...\n", injector["traceparent"]);
++        workspace
++            .put(&"/demo/example/eval".try_into().unwrap(), injector["traceparent"].clone().into())
++            .with_context(cx.clone())
++            .await
++            .unwrap();
++    }
++
++    println!("Get Data from {}'...\n", selector);
++    let mut data_stream = workspace.get(&selector.try_into().unwrap()).with_context(cx.clone()).await.unwrap();
++    let data = data_stream.next().with_context(cx.clone()).await.unwrap();
++    println!(
++        "  {} : {:?} (encoding: {} , timestamp: {})",
++        data.path,
++        data.value,
++        data.value.encoding_descr(),
++        data.timestamp
++    );
++
++    zenoh.close().with_context(cx).await.unwrap();
++    opentelemetry::global::force_flush_tracer_provider();
++    opentelemetry::global::shutdown_tracer_provider();
++}
++
++fn init_global_tracer() -> Result<sdktrace::Tracer, TraceError>{
++    global::set_text_map_propagator(TraceContextPropagator::new());
++    // let tags = [
++    //     resource::SERVICE_VERSION.string(version.to_owned()),
++    //     resource::SERVICE_INSTANCE_ID.string(instance_id.to_owned()),
++    //     resource::PROCESS_EXECUTABLE_PATH.string(std::env::current_exe().unwrap().display().to_string()),
++    //     resource::PROCESS_PID.string(std::process::id().to_string()),
++    //     KeyValue::new("process.executable.profile", PROFILE),
++    // ];
++
++    opentelemetry_jaeger::new_pipeline()
++        .with_service_name("z_get")
++        //.with_tags(tags.iter().map(ToOwned::to_owned))
++        .install_batch(opentelemetry::runtime::AsyncStd)
++}
++
++fn parse_args() -> (Properties, String) {
++    let args = App::new("zenoh get example")
++        .arg(
++            Arg::from_usage("-m, --mode=[MODE] 'The zenoh session mode (peer by default).")
++                .possible_values(&["peer", "client"]),
++        )
++        .arg(Arg::from_usage(
++            "-e, --peer=[LOCATOR]...  'Peer locators used to initiate the zenoh session.'",
++        ))
++        .arg(Arg::from_usage(
++            "-l, --listener=[LOCATOR]...   'Locators to listen on.'",
++        ))
++        .arg(Arg::from_usage(
++            "-c, --config=[FILE]      'A configuration file.'",
++        ))
++        .arg(
++            Arg::from_usage("-s, --selector=[SELECTOR] 'The selection of resources to get'")
++                .default_value("/demo/example/**"),
++        )
++        .arg(Arg::from_usage(
++            "--no-multicast-scouting 'Disable the multicast-based scouting mechanism.'",
++        ))
++        .get_matches();
++
++    let mut config = if let Some(conf_file) = args.value_of("config") {
++        Properties::try_from(std::path::Path::new(conf_file)).unwrap()
++    } else {
++        Properties::default()
++    };
++    for key in ["mode", "peer", "listener"].iter() {
++        if let Some(value) = args.values_of(key) {
++            config.insert(key.to_string(), value.collect::<Vec<&str>>().join(","));
++        }
++    }
++    if args.is_present("no-multicast-scouting") {
++        config.insert("multicast_scouting".to_string(), "false".to_string());
++    }
++
++    let selector = args.value_of("selector").unwrap().to_string();
++
++    (config, selector)
++}
+diff --git a/zenoh/examples/zenoh/t_put.rs b/zenoh/examples/zenoh/t_put.rs
+new file mode 100644
+index 0000000..e7808f4
+--- /dev/null
++++ b/zenoh/examples/zenoh/t_put.rs
+@@ -0,0 +1,156 @@
++//
++// Copyright (c) 2017, 2020 ADLINK Technology Inc.
++//
++// This program and the accompanying materials are made available under the
++// terms of the Eclipse Public License 2.0 which is available at
++// http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
++// which is available at https://www.apache.org/licenses/LICENSE-2.0.
++//
++// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
++//
++// Contributors:
++//   ADLINK zenoh team, <zenoh@adlink-labs.tech>
++//
++use clap::{App, Arg};
++use std::convert::{TryFrom, TryInto};
++use zenoh::*;
++use opentelemetry::trace::TraceError;
++use opentelemetry::{
++    global,
++    sdk::{trace as sdktrace, propagation::TraceContextPropagator},
++    trace::{FutureExt, TraceContextExt, Tracer},
++    Context,
++};
++use opentelemetry_jaeger;
++use std::collections::HashMap;
++
++#[async_std::main]
++async fn main() {
++    // initiate logging
++    env_logger::init();
++    // initate tracer
++    let _ = init_global_tracer().unwrap();
++    let span = global::tracer("z_put.rs").start("Put data");
++    let cx = Context::current_with_span(span);
++    let mut injector = HashMap::new();
++    global::get_text_map_propagator(|propagator| propagator.inject_context(&cx, &mut injector));
++
++    let (config, path, _value) = parse_args();
++
++    println!("New zenoh...");
++    let zenoh = Zenoh::new(config.into()).with_context(cx.clone()).await.unwrap();
++
++    println!("New workspace...");
++    let workspace = zenoh.workspace(None).with_context(cx.clone()).await.unwrap();
++
++    println!("Put Data ('{}': '{}')...\n", path, injector["traceparent"]);
++    workspace
++        .put(&path.try_into().unwrap(), injector["traceparent"].clone().into())
++        .with_context(cx.clone())
++        .await
++        .unwrap();
++
++    // --- Examples of put with other types:
++
++    // - Integer
++    // workspace.put(&"/demo/example/Integer".try_into().unwrap(), 3.into())
++    //     .await.unwrap();
++
++    // - Float
++    // workspace.put(&"/demo/example/Float".try_into().unwrap(), 3.14.into())
++    //     .await.unwrap();
++
++    // - Properties (as a Dictionary with str only)
++    // workspace.put(
++    //         &"/demo/example/Properties".try_into().unwrap(),
++    //         Properties::from("p1=v1;p2=v2").into()
++    //     ).await.unwrap();
++
++    // - Json (str format)
++    // workspace.put(
++    //         &"/demo/example/Json".try_into().unwrap(),
++    //         Value::Json(r#"{"kind"="memory"}"#.to_string()),
++    //     ).await.unwrap();
++
++    // - Raw ('application/octet-stream' encoding by default)
++    // workspace.put(
++    //         &"/demo/example/Raw".try_into().unwrap(),
++    //         vec![0x48u8, 0x69, 0x33].into(),
++    //     ).await.unwrap();
++
++    // - Custom
++    // workspace.put(
++    //         &"/demo/example/Custom".try_into().unwrap(),
++    //         Value::Custom {
++    //             encoding_descr: "my_encoding".to_string(),
++    //             data: vec![0x48u8, 0x69, 0x33].into(),
++    //     }).await.unwrap();
++
++    zenoh.close().with_context(cx).await.unwrap();
++    opentelemetry::global::force_flush_tracer_provider();
++    opentelemetry::global::shutdown_tracer_provider();
++}
++
++fn init_global_tracer() -> Result<sdktrace::Tracer, TraceError>{
++    global::set_text_map_propagator(TraceContextPropagator::new());
++    // let tags = [
++    //     resource::SERVICE_VERSION.string(version.to_owned()),
++    //     resource::SERVICE_INSTANCE_ID.string(instance_id.to_owned()),
++    //     resource::PROCESS_EXECUTABLE_PATH.string(std::env::current_exe().unwrap().display().to_string()),
++    //     resource::PROCESS_PID.string(std::process::id().to_string()),
++    //     KeyValue::new("process.executable.profile", PROFILE),
++    // ];
++
++    opentelemetry_jaeger::new_pipeline()
++        .with_service_name("z_put")
++        //.with_tags(tags.iter().map(ToOwned::to_owned))
++        .install_batch(opentelemetry::runtime::AsyncStd)
++}
++
++fn parse_args() -> (Properties, String, String) {
++    let args = App::new("zenoh put example")
++        .arg(
++            Arg::from_usage("-m, --mode=[MODE] 'The zenoh session mode (peer by default).")
++                .possible_values(&["peer", "client"]),
++        )
++        .arg(Arg::from_usage(
++            "-e, --peer=[LOCATOR]...  'Peer locators used to initiate the zenoh session.'",
++        ))
++        .arg(Arg::from_usage(
++            "-l, --listener=[LOCATOR]...   'Locators to listen on.'",
++        ))
++        .arg(Arg::from_usage(
++            "-c, --config=[FILE]      'A configuration file.'",
++        ))
++        .arg(
++            Arg::from_usage("-p, --path=[PATH]        'The name of the resource to put.'")
++                .default_value("/demo/example/zenoh-rs-put"),
++        )
++        .arg(
++            Arg::from_usage("-v, --value=[VALUE]      'The value of the resource to put.'")
++                .default_value("Put from Rust!"),
++        )
++        .arg(Arg::from_usage(
++            "--no-multicast-scouting 'Disable the multicast-based scouting mechanism.'",
++        ))
++        .get_matches();
++
++    let mut config = if let Some(conf_file) = args.value_of("config") {
++        Properties::try_from(std::path::Path::new(conf_file)).unwrap()
++    } else {
++        Properties::default()
++    };
++    for key in ["mode", "peer", "listener"].iter() {
++        if let Some(value) = args.values_of(key) {
++            config.insert(key.to_string(), value.collect::<Vec<&str>>().join(","));
++        }
++    }
++    if args.is_present("no-multicast-scouting") {
++        config.insert("multicast_scouting".to_string(), "false".to_string());
++    }
++
++    let path = args.value_of("path").unwrap().to_string();
++    let value = args.value_of("value").unwrap().to_string();
++
++    (config, path, value)
++}
+diff --git a/zenoh/examples/zenoh/t_sub.rs b/zenoh/examples/zenoh/t_sub.rs
+new file mode 100644
+index 0000000..f9b8ef9
+--- /dev/null
++++ b/zenoh/examples/zenoh/t_sub.rs
+@@ -0,0 +1,145 @@
++//
++// Copyright (c) 2017, 2020 ADLINK Technology Inc.
++//
++// This program and the accompanying materials are made available under the
++// terms of the Eclipse Public License 2.0 which is available at
++// http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
++// which is available at https://www.apache.org/licenses/LICENSE-2.0.
++//
++// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
++//
++// Contributors:
++//   ADLINK zenoh team, <zenoh@adlink-labs.tech>
++//
++use clap::{App, Arg};
++use futures::prelude::*;
++use futures::select;
++use std::convert::{TryFrom, TryInto};
++use zenoh::*;
++use opentelemetry::trace::TraceError;
++use opentelemetry::{
++    global,
++    sdk::{trace as sdktrace, propagation::TraceContextPropagator},
++    trace::Tracer,
++};
++use opentelemetry_jaeger;
++use std::collections::HashMap;
++
++#[async_std::main]
++async fn main() {
++    // initiate logging
++    env_logger::init();
++    // initate tracer
++    let _ = init_global_tracer().unwrap();
++
++    let (config, selector) = parse_args();
++
++    println!("New zenoh...");
++    let zenoh = Zenoh::new(config.into()).await.unwrap();
++
++    println!("New workspace...");
++    let workspace = zenoh.workspace(None).await.unwrap();
++
++    println!("Subscribe to {}'...\n", selector);
++    let mut change_stream = workspace
++        .subscribe(&selector.try_into().unwrap())
++        .await
++        .unwrap();
++
++    let mut stdin = async_std::io::stdin();
++    let mut input = [0u8];
++    loop {
++        select!(
++            change = change_stream.next().fuse() => {
++                let change = change.unwrap();
++                // read the trace format
++                let mut req_header = HashMap::new();
++                let value = match change.value.unwrap(){
++                    Value::StringUtf8(value) => value,
++                    _ => String::from("other data type"),
++                };
++                req_header.insert("traceparent".to_string(), value.clone());
++                //req_header.insert("tracestate", Some(""));
++
++                let parent_cx = global::get_text_map_propagator(|propagator| propagator.extract(&req_header));
++                drop(req_header);
++                let _span = global::tracer("z_eval.rs").start_with_context("Get data", parent_cx);
++
++                
++                println!(
++                    ">> [Subscription listener] received {:?} for {} : {:?} with timestamp {}",
++                    change.kind,
++                    change.path,
++                    value,
++                    change.timestamp
++                )
++            }
++
++            _ = stdin.read_exact(&mut input).fuse() => {
++                if input[0] == b'q' {break}
++            }
++        );
++    }
++
++    change_stream.close().await.unwrap();
++    zenoh.close().await.unwrap();
++}
++
++fn init_global_tracer() -> Result<sdktrace::Tracer, TraceError>{
++    global::set_text_map_propagator(TraceContextPropagator::new());
++    // let tags = [
++    //     resource::SERVICE_VERSION.string(version.to_owned()),
++    //     resource::SERVICE_INSTANCE_ID.string(instance_id.to_owned()),
++    //     resource::PROCESS_EXECUTABLE_PATH.string(std::env::current_exe().unwrap().display().to_string()),
++    //     resource::PROCESS_PID.string(std::process::id().to_string()),
++    //     KeyValue::new("process.executable.profile", PROFILE),
++    // ];
++
++    opentelemetry_jaeger::new_pipeline()
++        .with_service_name("z_sub")
++        //.with_tags(tags.iter().map(ToOwned::to_owned))
++        .install_batch(opentelemetry::runtime::AsyncStd)
++}
++
++fn parse_args() -> (Properties, String) {
++    let args = App::new("zenoh subscriber example")
++        .arg(
++            Arg::from_usage("-m, --mode=[MODE] 'The zenoh session mode (peer by default).")
++                .possible_values(&["peer", "client"]),
++        )
++        .arg(Arg::from_usage(
++            "-e, --peer=[LOCATOR]...  'Peer locators used to initiate the zenoh session.'",
++        ))
++        .arg(Arg::from_usage(
++            "-l, --listener=[LOCATOR]...   'Locators to listen on.'",
++        ))
++        .arg(Arg::from_usage(
++            "-c, --config=[FILE]      'A configuration file.'",
++        ))
++        .arg(
++            Arg::from_usage("-s, --selector=[selector] 'The selection of resources to subscribe'")
++                .default_value("/demo/example/**"),
++        )
++        .arg(Arg::from_usage(
++            "--no-multicast-scouting 'Disable the multicast-based scouting mechanism.'",
++        ))
++        .get_matches();
++
++    let mut config = if let Some(conf_file) = args.value_of("config") {
++        Properties::try_from(std::path::Path::new(conf_file)).unwrap()
++    } else {
++        Properties::default()
++    };
++    for key in ["mode", "peer", "listener"].iter() {
++        if let Some(value) = args.values_of(key) {
++            config.insert(key.to_string(), value.collect::<Vec<&str>>().join(","));
++        }
++    }
++    if args.is_present("no-multicast-scouting") {
++        config.insert("multicast_scouting".to_string(), "false".to_string());
++    }
++
++    let selector = args.value_of("selector").unwrap().to_string();
++
++    (config, selector)
++}
+diff --git a/zenoh/src/net/session.rs b/zenoh/src/net/session.rs
+index ce3bd7d..78f7932 100644
+--- a/zenoh/src/net/session.rs
++++ b/zenoh/src/net/session.rs
+@@ -37,6 +37,12 @@ use uhlc::HLC;
+ use zenoh_util::core::{ZError, ZErrorKind, ZResult};
+ use zenoh_util::sync::zpinbox;
+ use zenoh_util::{zconfigurable, zerror};
++use opentelemetry::{
++    global,
++    trace::{FutureExt, Tracer},
++    Context,
++};
++
+ 
+ zconfigurable! {
+     static ref API_DATA_RECEPTION_CHANNEL_SIZE: usize = 256;
+@@ -222,8 +228,21 @@ impl Session {
+                         join_publications,
+                     )
+                     .await;
++
++                    // get_active_span(|span|{
++                    //     span.add_event(
++                    //         format!("Start sleeing {} ms", *API_OPEN_SESSION_DELAY),
++                    //         vec![]
++                    //     )
++                    // });
++
++                    let tracer = global::tracer("session.rs");
++                    let span = tracer.start("Sleeping");
++                    let cx = Context::current_with_value(span);
+                     // Workaround for the declare_and_shoot problem
+-                    task::sleep(Duration::from_millis(*API_OPEN_SESSION_DELAY)).await;
++                    task::sleep(Duration::from_millis(*API_OPEN_SESSION_DELAY))
++                    .with_context(cx)
++                    .await;
+                     Ok(session)
+                 }
+                 Err(err) => Err(err),
+-- 
+2.25.1
+

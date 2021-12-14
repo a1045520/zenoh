@@ -37,6 +37,12 @@ use uhlc::HLC;
 use zenoh_util::core::{ZError, ZErrorKind, ZResult};
 use zenoh_util::sync::zpinbox;
 use zenoh_util::{zconfigurable, zerror};
+use opentelemetry::{
+    global,
+    trace::{FutureExt, Tracer},
+    Context,
+};
+
 
 zconfigurable! {
     static ref API_DATA_RECEPTION_CHANNEL_SIZE: usize = 256;
@@ -222,8 +228,21 @@ impl Session {
                         join_publications,
                     )
                     .await;
+
+                    // get_active_span(|span|{
+                    //     span.add_event(
+                    //         format!("Start sleeing {} ms", *API_OPEN_SESSION_DELAY),
+                    //         vec![]
+                    //     )
+                    // });
+
+                    let tracer = global::tracer("session.rs");
+                    let span = tracer.start("Sleeping");
+                    let cx = Context::current_with_value(span);
                     // Workaround for the declare_and_shoot problem
-                    task::sleep(Duration::from_millis(*API_OPEN_SESSION_DELAY)).await;
+                    task::sleep(Duration::from_millis(*API_OPEN_SESSION_DELAY))
+                    .with_context(cx)
+                    .await;
                     Ok(session)
                 }
                 Err(err) => Err(err),

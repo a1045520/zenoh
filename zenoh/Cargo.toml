@@ -89,6 +89,9 @@ uhlc = "0.3.1"
 uuid = { version = "0.8.2", features = ["v4"] }
 vec_map = "0.8.2"
 webpki = { version = "0.22.0", features = ["std"], optional = true }
+opentelemetry = { version = "0.16.0", features = ["rt-async-std"] }
+opentelemetry-jaeger = { version = "0.15.0", features = ["rt-async-std"] }
+opentelemetry-semantic-conventions = "0.8.0"
 
 [dev-dependencies]
 clap = "2.33.3"
@@ -217,6 +220,22 @@ path = "examples/zenoh-net/zn_ping.rs"
 [[example]]
 name = "zn_pong"
 path = "examples/zenoh-net/zn_pong.rs"
+
+[[example]]
+name = "t_eval"
+path = "examples/zenoh/t_eval.rs"
+
+[[example]]
+name = "t_get"
+path = "examples/zenoh/t_get.rs"
+
+[[example]]
+name = "t_put"
+path = "examples/zenoh/t_put.rs"
+
+[[example]]
+name = "t_sub"
+path = "examples/zenoh/t_sub.rs"
 
 [[bench]]
 name = "codec_bench"
